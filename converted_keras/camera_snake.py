@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import sys
 import threading
 import time
 from dataclasses import dataclass
+from enum import Enum
 from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, Optional, Sequence
@@ -30,8 +32,8 @@ Point = tuple[int, int]
 class Config:
     """Runtime settings for the application."""
 
-    model_path: Path = SCRIPT_DIR / "keras_model.h5"
-    labels_path: Path = SCRIPT_DIR / "labels.txt"
+    model_path: Path = SCRIPT_DIR / "snake_species_finetuned.h5"
+    labels_path: Path = SCRIPT_DIR / "snake_species_labels.txt"
     camera_index: int = 0
     image_size: tuple[int, int] = (224, 224)
     preview_size: tuple[int, int] = (1280, 720)
@@ -41,7 +43,7 @@ class Config:
     scan_cycle_seconds: float = 3.6
     ui_fps: float = 60.0
     mirror: bool = True
-    inference_interval_seconds: float = 0.12
+    scan_min_seconds: float = 1.8  # shortest scan; ends on a completed sweep
     top_k: int = 4
     confidence_high: float = 0.85
     confidence_medium: float = 0.60
@@ -62,6 +64,7 @@ class Theme:
     success: Color = (94, 197, 34)
     warning: Color = (40, 180, 250)
     danger: Color = (67, 76, 242)
+    disabled: Color = (100, 92, 80)
 
 
 THEME = Theme()
@@ -70,6 +73,24 @@ THEME = Theme()
 class Prediction(NamedTuple):
     label: str
     confidence: float
+
+
+class Mode(Enum):
+    """LIVE camera -> SCANNING a captured picture -> RESULT shown."""
+
+    LIVE = "live"
+    SCANNING = "scanning"
+    RESULT = "result"
+
+
+@dataclass
+class UiState:
+    """Everything the renderer needs to know about the interaction state."""
+
+    mode: Mode = Mode.LIVE
+    mirror: bool = False
+    scan_elapsed: float = 0.0
+    hover: Optional[str] = None
 
 
 # --------------------------------------------------------------------------- #
@@ -119,10 +140,10 @@ def load_model(config: Config) -> tuple["tf.keras.Model", list[str]]:
 
 
 def preprocess(frame: np.ndarray, size: tuple[int, int]) -> np.ndarray:
-    """BGR frame -> normalised RGB batch of one, shaped for the model."""
+    """BGR frame -> Teachable Machine's [-1, 1] RGB input format."""
     image = cv2.resize(frame, size)
     image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    return (image.astype(np.float32) / 255.0)[np.newaxis, ...]
+    return ((image.astype(np.float32) / 127.5) - 1.0)[np.newaxis, ...]
 
 
 def rank_predictions(
@@ -240,28 +261,39 @@ class CameraStream(_Worker):
 # Inference
 # --------------------------------------------------------------------------- #
 class InferenceWorker(_Worker):
-    """Runs the model on the newest frame at a fixed maximum rate."""
+    """Analyses a picture on request and publishes the result with its ticket."""
 
     def __init__(
         self,
         model: "tf.keras.Model",
         class_names: Sequence[str],
-        camera: CameraStream,
         config: Config,
         stop_event: threading.Event,
     ) -> None:
         super().__init__("model-inference", stop_event)
         self._model = model
         self._class_names = class_names
-        self._camera = camera
         self._config = config
+        self._request = threading.Event()
+        self._pending: Optional[np.ndarray] = None
+        self._ticket = 0
+        self._result_ticket = 0
         self._predictions: list[Prediction] = []
         self._latency_ms = 0.0
 
-    @property
-    def predictions(self) -> list[Prediction]:
+    def submit(self, frame: np.ndarray) -> int:
+        """Queue ``frame`` for analysis and return its ticket number."""
         with self._lock:
-            return list(self._predictions)
+            self._ticket += 1
+            self._pending = frame
+            ticket = self._ticket
+        self._request.set()
+        return ticket
+
+    def result(self) -> tuple[int, list[Prediction]]:
+        """Return ``(ticket_of_latest_result, predictions)`` atomically."""
+        with self._lock:
+            return self._result_ticket, list(self._predictions)
 
     @property
     def latency_ms(self) -> float:
@@ -269,13 +301,16 @@ class InferenceWorker(_Worker):
             return self._latency_ms
 
     def run(self) -> None:
-        last_sequence = -1
         try:
-            while not self._stop_event.wait(self._config.inference_interval_seconds):
-                frame, sequence, _ = self._camera.snapshot()
-                if frame is None or sequence == last_sequence:
+            while not self._stop_event.is_set():
+                if not self._request.wait(timeout=0.1):
                     continue
-                last_sequence = sequence
+                self._request.clear()
+                with self._lock:
+                    frame, ticket = self._pending, self._ticket
+                    self._pending = None
+                if frame is None:
+                    continue
 
                 started = time.perf_counter()
                 batch = preprocess(frame, self._config.image_size)
@@ -284,6 +319,7 @@ class InferenceWorker(_Worker):
                 latency = (time.perf_counter() - started) * 1000.0
                 with self._lock:
                     self._predictions = ranked
+                    self._result_ticket = ticket
                     self._latency_ms = latency
         except Exception as exc:  # noqa: BLE001
             self._fail(f"Model inference failed: {exc}")
@@ -333,6 +369,11 @@ class PreviewRenderer:
     SCAN_TRAIL = 120        # maximum length of the fading trail
     SCAN_GLOW_SIGMA = 9.0   # softness of the bloom around the line
     SCAN_CORE_SIGMA = 0.8   # thickness of the bright core
+    SCAN_FADE_SECONDS = 0.3  # how quickly the scan fades out / back in
+
+    BUTTON_HEIGHT = 46
+    BUTTON_GAP = 12
+    BUTTON_BOTTOM_MARGIN = 24
 
     def __init__(self, config: Config, theme: Theme = THEME) -> None:
         self._config = config
@@ -345,6 +386,20 @@ class PreviewRenderer:
             height - self.FOOTER_HEIGHT,
         )
         self._view_buffer: Optional[np.ndarray] = None
+        self._scan_strength = 0.0
+        self._last_elapsed: Optional[float] = None
+
+        # Clickable buttons live at the bottom of the side panel.
+        panel_x = self._view_box[2]
+        left = panel_x + self.PANEL_PADDING
+        panel_w = width - panel_x - 2 * self.PANEL_PADDING
+        button_w = (panel_w - self.BUTTON_GAP) // 2
+        top = height - self.FOOTER_HEIGHT - self.BUTTON_BOTTOM_MARGIN - self.BUTTON_HEIGHT
+        bottom = top + self.BUTTON_HEIGHT
+        self._buttons = {
+            "capture": (left, top, left + button_w, bottom),
+            "stop": (left + button_w + self.BUTTON_GAP, top, left + panel_w, bottom),
+        }
         view_width = self._view_box[2] - self._view_box[0]
         self._scan_fade = self._horizontal_fade(view_width, self.SCAN_MARGIN, self.SCAN_EDGE_FADE)
         accent = np.asarray(theme.accent, dtype=np.float32) / 255.0
@@ -352,27 +407,44 @@ class PreviewRenderer:
         self._scan_core_color = accent + (1.0 - accent) * 0.75  # lighter, near-white core
 
     # -- public ----------------------------------------------------------- #
+    @staticmethod
+    def enabled_buttons(mode: Mode) -> frozenset[str]:
+        if mode is Mode.LIVE:
+            return frozenset({"capture"})
+        if mode is Mode.SCANNING:
+            return frozenset({"stop"})
+        return frozenset({"capture", "stop"})  # RESULT
+
+    def button_at(self, x: int, y: int, mode: Mode) -> Optional[str]:
+        """Name of the enabled button under pixel (x, y), if any."""
+        for name in self.enabled_buttons(mode):
+            x1, y1, x2, y2 = self._buttons[name]
+            if x1 <= x <= x2 and y1 <= y <= y2:
+                return name
+        return None
+
     def render(
         self,
         frame: np.ndarray,
         predictions: Sequence[Prediction],
         elapsed: float,
         fps: float,
-        latency_ms: float = 0.0,
-        mirror: bool = False,
+        latency_ms: float,
+        ui: UiState,
     ) -> np.ndarray:
         width, height = self._config.preview_size
         image = np.empty((height, width, 3), dtype=np.uint8)  # fully overwritten below
 
         x1, y1, x2, y2 = self._view_box
         view = self._fit_frame(frame, (x2 - x1, y2 - y1))
-        if mirror:  # flip only the picture; overlays and text stay readable
+        if ui.mirror:  # flip only the picture; overlays and text stay readable
             cv2.flip(view, 1, dst=view)
-        self._draw_view_overlay(view, elapsed)
+        strength = self._update_scan_state(ui.mode, elapsed)
+        self._draw_view_overlay(view, ui, strength, self._guide_color(ui.mode, predictions))
         image[y1:y2, x1:x2] = view
 
-        self._draw_header(image, elapsed, fps, latency_ms)
-        self._draw_side_panel(image, predictions)
+        self._draw_header(image, elapsed, fps, latency_ms, ui.mode)
+        self._draw_side_panel(image, predictions, ui)
         self._draw_footer(image)
         return image
 
@@ -483,7 +555,9 @@ class PreviewRenderer:
         return width
 
     # -- sections --------------------------------------------------------- #
-    def _draw_header(self, image: np.ndarray, elapsed: float, fps: float, latency_ms: float) -> None:
+    def _draw_header(
+        self, image: np.ndarray, elapsed: float, fps: float, latency_ms: float, mode: Mode
+    ) -> None:
         t = self._theme
         width = image.shape[1]
         height = self.HEADER_HEIGHT
@@ -499,10 +573,15 @@ class PreviewRenderer:
 
         # Status chips, laid out right to left.
         pulse = 0.55 + 0.45 * (0.5 + 0.5 * np.sin(elapsed * 2.0 * np.pi * 1.2))
-        live_dot = tuple(int(c * pulse) for c in t.danger)
+        if mode is Mode.LIVE:
+            status_text, status_dot = "LIVE", tuple(int(c * pulse) for c in t.danger)
+        elif mode is Mode.SCANNING:
+            status_text, status_dot = "SCANNING", tuple(int(c * pulse) for c in t.accent)
+        else:
+            status_text, status_dot = "CAPTURED", t.success
         latency = f"{latency_ms:3.0f} MS" if latency_ms > 0 else "-- MS"
         chips = (
-            ("LIVE", live_dot),
+            (status_text, status_dot),
             (f"{fps:4.1f} FPS", None),
             (f"INFERENCE {latency}", None),
         )
@@ -511,6 +590,26 @@ class PreviewRenderer:
             x -= self._chip_width(text, dot is not None)
             self._chip(image, x, 32, text, dot)
             x -= 10
+
+    def _update_scan_state(self, mode: Mode, elapsed: float) -> float:
+        """Ease the scan effect in while SCANNING and out otherwise (0..1)."""
+        dt = 0.0 if self._last_elapsed is None else max(0.0, elapsed - self._last_elapsed)
+        self._last_elapsed = elapsed
+
+        target = 1.0 if mode is Mode.SCANNING else 0.0
+        blend = 1.0 - float(np.exp(-dt / self.SCAN_FADE_SECONDS))
+        self._scan_strength += (target - self._scan_strength) * blend
+        if abs(self._scan_strength - target) < 0.005:
+            self._scan_strength = target
+        return self._scan_strength
+
+    def _guide_color(self, mode: Mode, predictions: Sequence[Prediction]) -> Color:
+        t = self._theme
+        if mode is Mode.SCANNING:
+            return t.accent
+        if mode is Mode.RESULT and predictions:
+            return self._status(predictions[0])[0]
+        return t.text
 
     @staticmethod
     def _horizontal_fade(width: int, margin: int, fade: int) -> np.ndarray:
@@ -521,7 +620,7 @@ class PreviewRenderer:
         ramp = np.minimum(ramp_in, ramp_out)
         return ramp * ramp * (3.0 - 2.0 * ramp)
 
-    def _draw_scan_effect(self, view: np.ndarray, elapsed: float) -> None:
+    def _draw_scan_effect(self, view: np.ndarray, elapsed: float, strength: float = 1.0) -> None:
         """A sweeping scanner bar with bloom and a motion-aware fading trail.
 
         The position is computed in floating point from the clock (sub-pixel
@@ -529,6 +628,8 @@ class PreviewRenderer:
         direction of travel, and the layers are added as light so the bar looks
         luminous instead of painted on.
         """
+        if strength <= 0.0:
+            return
         height = view.shape[0]
         margin = self.SCAN_MARGIN
         cycle = (elapsed % self._config.scan_cycle_seconds) / self._config.scan_cycle_seconds
@@ -554,7 +655,7 @@ class PreviewRenderer:
         trail = np.clip(1.0 - behind / max(trail_length, 1.0), 0.0, 1.0) ** 2
         trail = np.where(behind > 0, trail, 0.0)
 
-        fade = self._scan_fade[np.newaxis, :]
+        fade = self._scan_fade[np.newaxis, :] * np.float32(strength)
         glow_2d = (0.34 * glow + 0.30 * trail).astype(np.float32)[:, np.newaxis] * fade
         core_2d = (0.95 * core).astype(np.float32)[:, np.newaxis] * fade
 
@@ -568,14 +669,15 @@ class PreviewRenderer:
         region = view[top:bottom]
         cv2.add(region, light, dst=region)  # saturating additive "light" blend
 
-    def _draw_view_overlay(self, view: np.ndarray, elapsed: float) -> None:
-        """Camera tag, corner guides and a soft scan line, drawn on the camera view."""
+    def _draw_view_overlay(
+        self, view: np.ndarray, ui: UiState, strength: float, guide_color: Color
+    ) -> None:
+        """Scan effect, corner guides and a status tag, drawn on the camera view."""
         t = self._theme
         height, width = view.shape[:2]
 
-        self._draw_scan_effect(view, elapsed)
+        self._draw_scan_effect(view, ui.scan_elapsed, strength)
 
-        # Corner guides.
         length, inset = 36, 20
         for x, y0, dx, dy in (
             (inset, inset, 1, 1),
@@ -583,12 +685,14 @@ class PreviewRenderer:
             (inset, height - inset, 1, -1),
             (width - inset, height - inset, -1, -1),
         ):
-            cv2.line(view, (x, y0), (x + dx * length, y0), t.text, 2, cv2.LINE_AA)
-            cv2.line(view, (x, y0), (x, y0 + dy * length), t.text, 2, cv2.LINE_AA)
+            cv2.line(view, (x, y0), (x + dx * length, y0), guide_color, 2, cv2.LINE_AA)
+            cv2.line(view, (x, y0), (x, y0 + dy * length), guide_color, 2, cv2.LINE_AA)
 
-        # Camera tag.
-        cam_w, cam_h = self._config.preview_size
-        self._chip(view, 36, 48, f"CAM 01   {cam_w}x{cam_h}", t.success)
+        if ui.mode is Mode.LIVE:
+            cam_w, cam_h = self._config.preview_size
+            self._chip(view, 36, 48, f"CAM 01   {cam_w}x{cam_h}", t.success)
+        else:
+            self._chip(view, 36, 48, "FROZEN FRAME", t.accent)
 
     def _status(self, prediction: Optional[Prediction]) -> tuple[Color, str]:
         t, c = self._theme, self._config
@@ -600,8 +704,11 @@ class PreviewRenderer:
             return t.warning, "MODERATE CONFIDENCE"
         return t.danger, "LOW CONFIDENCE"
 
-    def _draw_side_panel(self, image: np.ndarray, predictions: Sequence[Prediction]) -> None:
+    def _draw_side_panel(
+        self, image: np.ndarray, predictions: Sequence[Prediction], ui: UiState
+    ) -> None:
         t = self._theme
+        mode = ui.mode
         height, width = image.shape[:2]
         x1, y1, y2 = self._view_box[2], self.HEADER_HEIGHT, height - self.FOOTER_HEIGHT
         pad = self.PANEL_PADDING
@@ -611,26 +718,38 @@ class PreviewRenderer:
         image[y1:y2, x1:width] = t.panel
         cv2.line(image, (x1, y1), (x1, y2), t.divider, 1)
 
-        # Top match: circular confidence gauge.
+        # Top match: circular gauge (spinner while scanning).
         self._text(image, "TOP MATCH", (left, y1 + 38), 0.4, t.muted)
-        top = predictions[0] if predictions else None
+        top = predictions[0] if (predictions and mode is Mode.RESULT) else None
         confidence = float(np.clip(top.confidence, 0.0, 1.0)) if top else 0.0
-        status_color, status_text = self._status(top)
+
+        if top:
+            status_color, status_text = self._status(top)
+            gauge_text, label = f"{confidence:.0%}", top.label
+        elif mode is Mode.SCANNING:
+            status_color, status_text = t.accent, "ANALYZING..."
+            gauge_text, label = "...", "Scanning picture"
+        else:
+            status_color, status_text = t.muted, "READY TO SCAN"
+            gauge_text, label = "--", "Ready"
 
         gauge_center, radius, thickness = (center_x, y1 + 128), 64, 9
         cv2.circle(image, gauge_center, radius, t.track, thickness, cv2.LINE_AA)
-        if confidence > 0:
+        if mode is Mode.SCANNING:
+            angle = (ui.scan_elapsed * 300.0) % 360.0
+            cv2.ellipse(
+                image, gauge_center, (radius, radius), angle, 0, 100,
+                t.accent, thickness, cv2.LINE_AA,
+            )
+        elif confidence > 0:
             cv2.ellipse(
                 image, gauge_center, (radius, radius), 0,
                 -90, -90 + 360 * confidence, status_color, thickness, cv2.LINE_AA,
             )
-        self._text_centered(
-            image, f"{confidence:.0%}" if top else "--",
-            center_x, gauge_center[1] + 12, 1.0, t.text, 2,
-        )
+        self._text_centered(image, gauge_text, center_x, gauge_center[1] + 12, 1.0, t.text, 2)
 
         label_y = gauge_center[1] + radius + 46
-        label = self._fit_label(top.label if top else "No result yet", panel_w, 0.72, 2)
+        label = self._fit_label(label, panel_w, 0.72, 2)
         self._text_centered(image, label, center_x, label_y, 0.72, t.text, 2)
 
         pill_w = self._text_width(status_text, 0.4) + 32
@@ -641,25 +760,67 @@ class PreviewRenderer:
         )
         self._text_centered(image, status_text, center_x, pill_cy + 5, 0.4, status_color)
 
-        # Runner-up predictions.
         divider_y = pill_cy + 38
         cv2.line(image, (left, divider_y), (left + panel_w, divider_y), t.divider, 1)
-        self._text(image, "OTHER CANDIDATES", (left, divider_y + 32), 0.4, t.muted)
 
-        for index, prediction in enumerate(predictions[1:]):
-            row_y = divider_y + 72 + index * 58
-            value = float(np.clip(prediction.confidence, 0.0, 1.0))
-            percent = f"{value:.0%}"
-            percent_w = self._text_width(percent, 0.46)
-            name = self._fit_label(prediction.label, panel_w - percent_w - 16, 0.46, 1)
+        if mode is Mode.RESULT and len(predictions) > 1:
+            self._text(image, "OTHER CANDIDATES", (left, divider_y + 32), 0.4, t.muted)
+            for index, prediction in enumerate(predictions[1:]):
+                row_y = divider_y + 72 + index * 58
+                value = float(np.clip(prediction.confidence, 0.0, 1.0))
+                percent = f"{value:.0%}"
+                percent_w = self._text_width(percent, 0.46)
+                name = self._fit_label(prediction.label, panel_w - percent_w - 16, 0.46, 1)
 
-            self._text(image, name, (left, row_y), 0.46, t.text)
-            self._text(image, percent, (left + panel_w - percent_w, row_y), 0.46, t.muted)
-            bar_top = row_y + 12
-            self._rounded_rect(image, left, bar_top, left + panel_w, bar_top + 6, 3, t.track)
-            fill = int(panel_w * value)
-            if fill >= 6:
-                self._rounded_rect(image, left, bar_top, left + fill, bar_top + 6, 3, t.accent)
+                self._text(image, name, (left, row_y), 0.46, t.text)
+                self._text(image, percent, (left + panel_w - percent_w, row_y), 0.46, t.muted)
+                bar_top = row_y + 12
+                self._rounded_rect(image, left, bar_top, left + panel_w, bar_top + 6, 3, t.track)
+                fill = int(panel_w * value)
+                if fill >= 6:
+                    self._rounded_rect(image, left, bar_top, left + fill, bar_top + 6, 3, t.accent)
+        else:
+            hints = {
+                Mode.LIVE: ("Aim the camera at a snake,", "then press CAPTURE to scan it."),
+                Mode.SCANNING: ("Analyzing the captured", "picture. Press STOP to cancel."),
+                Mode.RESULT: ("No other candidates.",),
+            }[mode]
+            for index, line in enumerate(hints):
+                self._text(image, line, (left, divider_y + 36 + index * 24), 0.44, t.muted)
+
+        self._draw_buttons(image, ui)
+
+    def _draw_buttons(self, image: np.ndarray, ui: UiState) -> None:
+        t = self._theme
+        enabled = self.enabled_buttons(ui.mode)
+
+        for name, (x1, y1, x2, y2) in self._buttons.items():
+            active = name in enabled
+            hovered = active and ui.hover == name
+            if name == "capture":
+                label = "CAPTURE"
+                background = t.accent if active else t.card
+                foreground = t.background if active else t.disabled
+                if hovered:
+                    background = tuple(min(255, c + 28) for c in background)
+            else:
+                label = "STOP"
+                background = t.divider if hovered else t.card
+                foreground = t.danger if active else t.disabled
+
+            self._rounded_rect(image, x1, y1, x2, y2, 10, background)
+            center_y = (y1 + y2) // 2
+            text_w = self._text_width(label, 0.46, 2)
+            start_x = (x1 + x2) // 2 - (20 + 10 + text_w) // 2
+            icon_x = start_x + 10
+            if name == "capture":  # shutter icon
+                cv2.circle(image, (icon_x, center_y), 9, foreground, 2, cv2.LINE_AA)
+                cv2.circle(image, (icon_x, center_y), 4, foreground, -1, cv2.LINE_AA)
+            else:  # stop icon
+                self._rounded_rect(
+                    image, icon_x - 7, center_y - 7, icon_x + 7, center_y + 7, 3, foreground
+                )
+            self._text(image, label, (start_x + 30, center_y + 5), 0.46, foreground, 2)
 
     def _draw_footer(self, image: np.ndarray) -> None:
         t = self._theme
@@ -668,7 +829,7 @@ class PreviewRenderer:
 
         image[top:height] = t.panel
         cv2.line(image, (0, top), (width, top), t.divider, 1)
-        self._text(image, "Q / ESC   CLOSE      M   MIRROR", (24, height - 10), 0.36, t.muted)
+        self._text(image, "SPACE  CAPTURE      S  STOP      M  MIRROR      Q  QUIT", (24, height - 10), 0.36, t.muted)
 
         in_w, in_h = self._config.image_size
         info = f"MODEL INPUT {in_w}x{in_h}   |   TEACHABLE MACHINE"
@@ -700,6 +861,68 @@ def is_window_open(window_name: str) -> bool:
         return False
 
 
+class MouseState:
+    """Latest pointer position and pending click, written by the OpenCV callback."""
+
+    def __init__(self) -> None:
+        self.position: Point = (-1, -1)
+        self.click: Optional[Point] = None
+
+    def callback(self, event: int, x: int, y: int, flags: int, param: object) -> None:
+        self.position = (x, y)
+        if event == cv2.EVENT_LBUTTONUP:
+            self.click = (x, y)
+
+
+class CaptureSession:
+    """State machine: LIVE -> (capture) SCANNING -> RESULT -> (stop) LIVE."""
+
+    def __init__(self, config: Config) -> None:
+        self._min_scan = config.scan_min_seconds
+        self._half_cycle = config.scan_cycle_seconds / 2.0  # one full up or down sweep
+        self.mode = Mode.LIVE
+        self.frame: Optional[np.ndarray] = None
+        self.predictions: list[Prediction] = []
+        self._scan_started = 0.0
+        self._ticket = 0
+        self._finish_at: Optional[float] = None
+
+    def scan_elapsed(self, now: float) -> float:
+        return 0.0 if self.mode is Mode.LIVE else now - self._scan_started
+
+    def handle(
+        self, action: Optional[str], live_frame: Optional[np.ndarray], now: float,
+        inference: InferenceWorker,
+    ) -> None:
+        if action == "capture" and self.mode is not Mode.SCANNING and live_frame is not None:
+            self.frame = live_frame  # camera.read() returns a fresh array each time
+            self.predictions = []
+            self.mode = Mode.SCANNING
+            self._scan_started = now
+            self._finish_at = None
+            self._ticket = inference.submit(live_frame)
+            LOGGER.info("Picture captured; scanning.")
+        elif action == "stop" and self.mode is not Mode.LIVE:
+            self.mode, self.frame, self.predictions = Mode.LIVE, None, []
+            LOGGER.info("Stopped; back to live view.")
+
+    def update(self, now: float, inference: InferenceWorker) -> None:
+        """Finish the scan once the result is ready and a sweep has completed."""
+        if self.mode is not Mode.SCANNING:
+            return
+        elapsed = now - self._scan_started
+        if elapsed < self._min_scan:
+            return
+        ticket, predictions = inference.result()
+        if ticket != self._ticket:
+            return
+        if self._finish_at is None:  # end on a completed sweep, not mid-way
+            self._finish_at = self._half_cycle * math.ceil((elapsed - 0.05) / self._half_cycle)
+        if elapsed >= self._finish_at:
+            self.predictions = predictions
+            self.mode = Mode.RESULT
+
+
 def run(config: Config) -> None:
     enable_dpi_awareness()
     model, class_names = load_model(config)
@@ -711,14 +934,17 @@ def run(config: Config) -> None:
     else:
         LOGGER.info("Camera accepted a request for %.0f FPS.", requested_fps)
 
+    mouse = MouseState()
     cv2.namedWindow(config.window_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(config.window_name, *config.window_size)
-    LOGGER.info("Live preview started. Close the window, or press Q or Esc to quit.")
+    cv2.setMouseCallback(config.window_name, mouse.callback)
+    LOGGER.info("Live preview started. Press SPACE or click CAPTURE to scan; Q or Esc to quit.")
 
     stop_event = threading.Event()
     stream = CameraStream(camera, stop_event)
-    inference = InferenceWorker(model, class_names, stream, config, stop_event)
+    inference = InferenceWorker(model, class_names, config, stop_event)
     renderer = PreviewRenderer(config)
+    session = CaptureSession(config)
     start_time = time.perf_counter()
     frame_interval = 1.0 / config.ui_fps
     mirror = config.mirror
@@ -732,20 +958,28 @@ def run(config: Config) -> None:
             if error:
                 raise RuntimeError(error)
 
-            frame, _, fps = stream.snapshot()
-            if frame is None:
+            live_frame, _, fps = stream.snapshot()
+            if live_frame is None:
                 cv2.waitKey(1)
                 if not is_window_open(config.window_name):
                     break
                 continue
 
+            now = time.perf_counter()
+            click, mouse.click = mouse.click, None
+            if click is not None:
+                session.handle(renderer.button_at(*click, session.mode), live_frame, now, inference)
+            session.update(now, inference)
+
+            ui = UiState(
+                mode=session.mode,
+                mirror=mirror,
+                scan_elapsed=session.scan_elapsed(now),
+                hover=renderer.button_at(*mouse.position, session.mode),
+            )
+            frame = live_frame if session.mode is Mode.LIVE else session.frame
             preview = renderer.render(
-                frame,
-                inference.predictions,
-                time.perf_counter() - start_time,
-                fps,
-                inference.latency_ms,
-                mirror,
+                frame, session.predictions, now - start_time, fps, inference.latency_ms, ui
             )
             cv2.imshow(config.window_name, preview)
 
@@ -755,9 +989,14 @@ def run(config: Config) -> None:
             if next_tick < now:  # running behind: resync instead of spiralling
                 next_tick = now
             key = cv2.waitKey(max(1, int((next_tick - now) * 1000))) & 0xFF
-            if key in (ord("m"), ord("M")):
+
+            if key in (ord(" "), ord("c"), ord("C")):
+                session.handle("capture", live_frame, now, inference)
+            elif key in (ord("s"), ord("S")):
+                session.handle("stop", live_frame, now, inference)
+            elif key in (ord("m"), ord("M")):
                 mirror = not mirror
-            if key in (ord("q"), 27) or not is_window_open(config.window_name):
+            if key in (ord("q"), ord("Q"), 27) or not is_window_open(config.window_name):
                 break
 
         error = stream.error or inference.error

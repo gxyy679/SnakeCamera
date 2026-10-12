@@ -1,0 +1,34 @@
+0 Non-venomous snake
+1 Blunt-headed Slug Eater
+2 Blunt-tailed Reed Snake
+3 Cumming's Blind Snake
+4 Island Wolf Snake
+5 Mindanao Keelback
+6 Mindanao Mountain Stream Keelback
+7 Mindanao Stripe-tailed Bronzeback
+8 Philippine Banded Burrowing Snake
+9 Philippine Bandless Burrowing Snake
+10 Philippine Ground Snake
+11 Philippine Painted Bronzeback
+12 Philippine Rat Snake
+13 Philippine Reed Snake
+14 Philippine Spotted Kukri Snake
+15 Red-tailed Green Rat Snake
+16 Reticulated Python
+17 Southern Triangle-spotted Snake
+18 Variable Reed Snake
+19 Zamboanga Dwarf Reed Snake
+20 Venomous snake
+21 Dog-toothed Cat Snake
+22 Dusky Mock Viper
+23 Eastern Mangrove Cat Snake
+24 King Cobra
+25 Paradise Flying Tree Snake
+26 Philippine Striped Coral Snake
+27 Philippine Striped Keelback
+28 Philippine Vine Snake
+29 Short-nosed Whip Snake
+30 Southeastern Philippine Spitting Cobra
+31 White-lined Keelback
+32 White-spotted Cat Snake
+33 Yellow-spotted Pit Viper
