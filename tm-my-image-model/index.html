@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Fine-tune Snake Model</title>
+    <!-- I-load ang TensorFlow.js -->
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@latest/dist/tf.min.js"></script>
+</head>
+<body>
+    <h1>I-upload ang imong mga Snake Images</h1>
+    <input type="file" id="imageUpload" webkitdirectory directory multiple />
+    <button id="trainBtn" disabled>Start Training</button>
+    <div id="status"></div>
+
+    <script>
+        let model;
+        let xs, ys; // Training data (tensors)
+
+        // 1. I-load ang imong Teachable Machine Model (TF.js format)
+        async function loadModel() {
+            model = await tf.loadLayersModel('tm-my-image-model/model.json');
+            document.getElementById('status').innerText = "Model loaded!";
+        }
+        loadModel();
+
+        // 2. Pag-andam sa Data (Kinahanglan nimo i-convert ang images ngadto sa tensors)
+        // Kini nga part kay komplikado. Kinahanglan nimo i-resize ang images ngadto sa 224x224
+        // ug i-normalize ang pixel values (0-1).
+        
+        // 3. I-modify ang Model (Tangtanga ang last layer, dugangi og bag-o)
+        function prepareModel(numClasses) {
+            // I-freeze ang tanan gawas sa last layer
+            model.layers.forEach((layer, index) => {
+                if (index < model.layers.length - 1) layer.trainable = false;
+            });
+
+            // Tangtanga ang last layer ug dugangi og bag-o
+            // (Kini nga part lisod sa TF.js kung Sequential model, mas sayon kung Functional)
+            const newModel = tf.sequential();
+            for (let i = 0; i < model.layers.length - 1; i++) {
+                newModel.add(model.layers[i]);
+            }
+            newModel.add(tf.layers.dense({ units: numClasses, activation: 'softmax' }));
+            
+            newModel.compile({
+                optimizer: tf.train.adam(0.0001),
+                loss: 'categoricalCrossentropy',
+                metrics: ['accuracy']
+            });
+            return newModel;
+        }
+
+        // 4. I-train ang Model
+        async function trainModel() {
+            document.getElementById('status').innerText = "Nag-training...";
+            // xs = imong image tensors, ys = imong labels (one-hot encoded)
+            await model.fit(xs, ys, {
+                epochs: 10,
+                batchSize: 32,
+                validationSplit: 0.2,
+                callbacks: {
+                    onEpochEnd: (epoch, logs) => {
+                        console.log(`Epoch ${epoch}: loss = ${logs.loss}`);
+                        document.getElementById('status').innerText = `Epoch ${epoch} done. Loss: ${logs.loss.toFixed(4)}`;
+                    }
+                }
+            });
+            document.getElementById('status').innerText = "Human na!";
+            
+            // 5. I-save ang bag-ong model
+            await model.save('downloads://my-fine-tuned-model');
+        }
+    </script>
+</body>
+</html>
